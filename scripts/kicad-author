@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""kicad-author —— Generate readable KiCad schematics and PCBs from code.
+
+  kicad-author sch      --project <dir>   Generate .kicad_sch
+  kicad-author gate     --project <dir>   Compare against the golden netlist
+  kicad-author env                        Print detected tool paths
+
+The project must provide design.py (source of truth: PARTS/NETS/NO_CONNECT/ZONES/POWER_NETS…)
+and layout.py (presentation: SCH_LAYOUT/ZONE_RECT…). See SKILL.md for the contract.
+"""
+import argparse
+import importlib.util
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from kicad_author import gates                      # noqa: E402
+from kicad_author.schematic import SchematicWriter  # noqa: E402
+
+
+def find_kicad():
+    """Return (kicad-cli, interpreter with pcbnew, symbol directory, footprint directory)."""
+    env = os.environ
+    cli = env.get("KICAD_CLI")
+    cands = [cli] if cli else []
+    cands += ["/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli",
+              "/usr/bin/kicad-cli", "/usr/local/bin/kicad-cli",
+              shutil.which("kicad-cli"),
+              r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe",
+              r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe"]
+    cli = next((c for c in cands if c and pathlib.Path(c).exists()), None)
+    share = None
+    for p in ("/Applications/KiCad/KiCad.app/Contents/SharedSupport",
+              "/usr/share/kicad", "/usr/local/share/kicad",
+              r"C:\Program Files\KiCad\9.0\share\kicad",
+              r"C:\Program Files\KiCad\10.0\share\kicad"):
+        if pathlib.Path(p, "symbols").is_dir():
+            share = pathlib.Path(p)
+            break
+    py = env.get("KICAD_PY")
+    if not py:
+        # macOS: bundled KiCad interpreter; Linux/Windows: pcbnew is usually in system Python
+        for g in sorted(pathlib.Path(
+                "/Applications/KiCad/KiCad.app/Contents/Frameworks"
+                "/Python.framework/Versions").glob(
+                "*/Resources/Python.app/Contents/MacOS/Python"), reverse=True):
+            py = str(g)
+            break
+    if not py:
+        for c in (sys.executable, shutil.which("python3"),
+                  r"C:\Program Files\KiCad\10.0\bin\python.exe",
+                  r"C:\Program Files\KiCad\9.0\bin\python.exe"):
+            if c and subprocess.call([c, "-c", "import pcbnew"],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL) == 0:
+                py = c
+                break
+    return cli, py, (share / "symbols" if share else None), (share / "footprints" if share else None)
+
+
+def load_module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None:
+        sys.exit(f"Failed to load: {path}")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+def cmd_sch(a):
+    proj = pathlib.Path(a.project).resolve()
+    design = load_module(proj / "src" / "design.py", "design")
+    lay_path = proj / "src" / "layout.py"
+    layout = load_module(lay_path, "layout") if lay_path.exists() else design
+    _cli, _py, syms, _fps = find_kicad()
+    if syms is None:
+        sys.exit("Cannot find the KiCad symbol library directory")
+    paths = {n: syms / f"{n}.kicad_sym" for n in ("Device", "Connector_Generic", "power")}
+    for name, p in getattr(design, "LOCAL_SYM_LIBS", {}).items():
+        paths[name] = proj / p
+    board = getattr(design, "BOARD_NAME", proj.name)
+    w = SchematicWriter(design, layout, paths, project=board)
+    stats, wired, fallback = w.build()
+    out = proj / f"{board}.kicad_sch"
+    w.write(out, proj / "src" / "uuids.json")
+    print(f"✓ {out.name}: {len(design.PARTS)} parts / {len(design.ZONES)} zones / "
+          f"wired nets {stats['wire']} / power-symbol nets {stats['power']} / "
+          f"labeled nets {stats['label']} / NC {len(design.NO_CONNECT)}")
+    if wired:
+        print("   Wired: " + ", ".join(sorted(wired)))
+    if fallback:
+        print(f"   ⚠ No valid route within the zone; falling back to labels: {sorted(fallback)}")
+
+
+def cmd_gate(a):
+    proj = pathlib.Path(a.project).resolve()
+    design = load_module(proj / "src" / "design.py", "design")
+    board = getattr(design, "BOARD_NAME", proj.name)
+    net = proj / "build" / f"{board}.net"
+    if not net.exists():
+        sys.exit(f"Missing {net} — run kicad-cli sch export netlist first")
+    from kicad_author import _sexp_min as sp
+    ok, *_ = gates.golden_table(net, design.NETS, sp)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_env(a):
+    cli, py, syms, fps = find_kicad()
+    if a.export:                      # For shell `eval "$(kicad-author env --export)"`
+        for k, v in (("KICAD_CLI", cli), ("KICAD_PY", py),
+                     ("KICAD_SYMBOL_DIR", syms), ("KICAD_FOOTPRINT_DIR", fps)):
+            if v:
+                print(f'export {k}="{v}"')
+        return
+    for k, v in (("kicad-cli", cli), ("pcbnew python", py),
+                 ("symbols", syms), ("footprints", fps)):
+        print(f"  {k:16s} {v or 'not found'}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="kicad-author", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name, fn in (("sch", cmd_sch), ("gate", cmd_gate)):
+        s = sub.add_parser(name)
+        s.add_argument("--project", default=".")
+        s.set_defaults(fn=fn)
+    e = sub.add_parser("env")
+    e.add_argument("--export", action="store_true",
+                   help="Print shell export statements for eval")
+    e.set_defaults(fn=cmd_env)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -21,7 +21,7 @@ import pathlib
 
 from .status import bind_file, sha256_of
 
-SCHEMA = 1
+SCHEMA = 2
 
 EMPTY = {"schema": SCHEMA, "copper_layers": [], "layer_roles": {}, "outline": None,
          "netclasses": {}, "net_class_of": {}, "footprints": [], "pads": [],
@@ -43,7 +43,8 @@ def save(facts, path):
 def load(path):
     f = json.loads(pathlib.Path(path).read_text())
     if f.get("schema") != SCHEMA:
-        raise ValueError("facts schema %r, expected %r" % (f.get("schema"), SCHEMA))
+        raise ValueError("facts schema %r, expected %r — run kicad-author facts to re-extract"
+                         % (f.get("schema"), SCHEMA))
     return f
 
 
@@ -71,11 +72,18 @@ def companion_is_fresh(bound, report_path):
     p = pathlib.Path(report_path)
     if not p.exists():
         return None
-    board_mtime = (bound.get("board") or {}).get("mtime")
-    if not board_mtime:
+    board_mtime = (bound.get("board") or {}).get("mtime_ns")
+    if board_mtime is None:
         return None
-    rep = datetime.datetime.fromtimestamp(p.stat().st_mtime).replace(microsecond=0)
-    return rep >= datetime.datetime.fromisoformat(board_mtime)
+    return p.stat().st_mtime_ns >= board_mtime
+
+
+def via_layers(copper_layers, endpoints):
+    """Expand a via span in physical stack order, independent of KiCad layer IDs."""
+    def order(name):
+        return 0 if name == "F.Cu" else 33 if name == "B.Cu" else int(name[2:-3])
+    lo, hi = sorted(order(n) for n in (endpoints[0], endpoints[-1]))
+    return sorted((n for n in copper_layers if lo <= order(n) <= hi), key=order)
 
 
 # ── accessors ──────────────────────────────────────────────────────────────────

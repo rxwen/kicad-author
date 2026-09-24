@@ -62,6 +62,12 @@ scripts/kicad-author facts --project <dir>      # Snapshot the saved board (need
 scripts/kicad-author check --project <dir> --stage sch|preroute|final
 ```
 
+Facts snapshots use schema 2: pad copper polygons, complete via layer spans and
+nanosecond artifact timestamps. Regenerate older snapshots with `kicad-author facts
+--project <dir>` before checking them. Pad curves use KiCad's outward polygon
+approximation with a 0.001 mm tolerance. ERC/DRC command failures stop the build;
+missing net-class assignments are gating `unknown` results.
+
 Projects provide **data** — `src/design.py` (what the board is, and how its parts relate),
 `src/layout.py` (where things go) and `src/physical.py` (under what rules copper may exist);
 the skill provides **mechanisms**. See [`SKILL.md`](SKILL.md) for the contract and

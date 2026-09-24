@@ -20,7 +20,7 @@ echo "── 1/9 Generate schematic ──"
 echo "── 2/9 ERC + netlist export ──"
 # Both severities: warnings are reported at tier 3, never silently dropped.
 "$KICAD_CLI" sch erc --format json --severity-error --severity-warning \
-    -o build/erc.json "$NAME.kicad_sch" || true
+    -o build/erc.json "$NAME.kicad_sch"
 "$KICAD_CLI" sch export netlist --format kicadsexpr -o "build/$NAME.net" "$NAME.kicad_sch" >/dev/null
 
 echo "── 3/9 Gate: schematic stage ──"
@@ -55,7 +55,7 @@ echo "── 8/9 Finalize: refill pours, save, snapshot the saved board ──"
 
 echo "── 9/9 Gate: DRC + final report ──"
 "$KICAD_CLI" pcb drc --format json --schematic-parity \
-    --severity-error --severity-warning -o build/drc.json "$NAME.kicad_pcb" || true
+    --severity-error --severity-warning -o build/drc.json "$NAME.kicad_pcb"
 "$KA" check --project . --stage final --facts build/facts.json
 
 echo "✅ Build passed — report: build/report-final.json"

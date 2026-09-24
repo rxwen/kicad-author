@@ -104,6 +104,25 @@ def dist(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
 
+def point_segment_distance(p, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    den = dx * dx + dy * dy
+    t = max(0, min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / den)) if den else 0
+    return dist(p, (a[0] + t * dx, a[1] + t * dy))
+
+
+def stroke_touches_poly(a, b, radius, polygon):
+    """Round-ended copper segment against a polygon, including its full width."""
+    if seg_touches_poly(a, b, polygon):
+        return True
+    for i, c in enumerate(polygon):
+        d = polygon[(i + 1) % len(polygon)]
+        if min(point_segment_distance(a, c, d), point_segment_distance(b, c, d),
+               point_segment_distance(c, a, b), point_segment_distance(d, a, b)) <= radius + EPS:
+            return True
+    return False
+
+
 def bbox(points):
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]

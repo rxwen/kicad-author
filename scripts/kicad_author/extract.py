@@ -118,6 +118,14 @@ def extract(board_path):
         })
         for p in fp.Pads():
             attr = p.GetAttribute()
+            copper = {}
+            for ly in _layer_set(b, p):
+                shape = pcbnew.SHAPE_POLY_SET()
+                # KiCad supplies board-coordinate geometry including rotation and
+                # custom shapes. Approximate curved edges outward by at most 1 um.
+                p.TransformShapeToPolygon(shape, b.GetLayerID(ly), 0,
+                                          pcbnew.FromMM(0.001), pcbnew.ERROR_OUTSIDE)
+                copper[ly] = _regions(shape)
             f["pads"].append({
                 "ref": fp.GetReference(), "pad": p.GetNumber(),
                 "net": p.GetNetname() or None, "pos": _pt(p.GetPosition()),
@@ -126,14 +134,16 @@ def extract(board_path):
                          pcbnew.PAD_ATTRIB_NPTH: "npth",
                          pcbnew.PAD_ATTRIB_CONN: "conn"}.get(attr, str(attr)),
                 "size": [_mm(p.GetSize().x), _mm(p.GetSize().y)],
+                "copper": copper,
             })
 
     for t in b.GetTracks():
         if t.Type() == pcbnew.PCB_VIA_T:
             f["vias"].append({"net": t.GetNetname() or None, "pos": _pt(t.GetPosition()),
                               "diameter": _mm(t.GetWidth()), "drill": _mm(t.GetDrill()),
-                              "layers": [b.GetLayerName(t.TopLayer()),
-                                         b.GetLayerName(t.BottomLayer())]})
+                              "layers": F.via_layers(f["copper_layers"],
+                                         [b.GetLayerName(t.TopLayer()),
+                                          b.GetLayerName(t.BottomLayer())])})
         else:
             f["tracks"].append({"net": t.GetNetname() or None,
                                 "layer": b.GetLayerName(t.GetLayer()),

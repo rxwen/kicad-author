@@ -54,10 +54,10 @@ def _external_report(bound, path, id_prefix, title, tier=1, critical=True):
         return [Check("%s.missing" % id_prefix, tier, title, UNKNOWN,
                       "%s not found — check never ran" % p.name, critical=critical)]
     fresh = F.companion_is_fresh(bound, p)
-    if fresh is False:
+    if fresh is not True:
         return [Check("%s.stale" % id_prefix, tier, title, UNKNOWN,
-                      "%s is older than the artifact it describes — it is about a "
-                      "version that no longer exists" % p.name, critical=critical)]
+                      "%s is stale or lacks a precise artifact timestamp — rerun the check"
+                      % p.name, critical=critical)]
     doc = _load_json(p)
     if doc is None:
         return [Check("%s.unreadable" % id_prefix, tier, title, UNKNOWN,
@@ -365,11 +365,13 @@ def _intrusions(facts, region_poly, layers):
     """Everything copper that enters `region_poly` on any of `layers`."""
     hits = []
     for t in facts.get("tracks", []):
-        if t["layer"] in layers and poly.seg_touches_poly(
-                tuple(t["start"]), tuple(t["end"]), region_poly):
+        if t["layer"] in layers and poly.stroke_touches_poly(
+                tuple(t["start"]), tuple(t["end"]), t["width"] / 2, region_poly):
             hits.append("track %s on %s" % (t.get("net") or "?", t["layer"]))
     for v in facts.get("vias", []):
-        if poly.point_in_poly(tuple(v["pos"]), region_poly) and set(v.get("layers", ())) & set(layers):
+        span = F.via_layers(facts.get("copper_layers") or v["layers"], v["layers"])
+        if set(span) & set(layers) and poly.stroke_touches_poly(
+                tuple(v["pos"]), tuple(v["pos"]), v["diameter"] / 2, region_poly):
             hits.append("via %s at %.2f,%.2f" % (v.get("net") or "?", v["pos"][0], v["pos"][1]))
     for z in facts.get("zones", []):
         for ly, regs in (z.get("filled") or {}).items():
@@ -380,8 +382,13 @@ def _intrusions(facts, region_poly, layers):
                     hits.append("filled copper %s on %s" % (z.get("net") or "?", ly))
                     break
     for p in facts.get("pads", []):
-        if set(p.get("layers", ())) & set(layers) and poly.point_in_poly(tuple(p["pos"]), region_poly):
-            hits.append("pad %s.%s" % (p["ref"], p["pad"]))
+        for ly in set(p.get("layers", ())) & set(layers):
+            regions = (p.get("copper") or {}).get(ly)
+            if regions is None:
+                hits.append("pad %s.%s: copper geometry unavailable on %s; re-extract facts"
+                            % (p["ref"], p["pad"], ly))
+            elif any(poly.region_overlaps_poly(r, region_poly) for r in regions):
+                hits.append("pad %s.%s" % (p["ref"], p["pad"]))
     return hits
 
 
@@ -452,26 +459,31 @@ def _netclass_checks(facts, physical):
         return [Check("t1.netclasses", 1, "Net classes in force", UNKNOWN,
                       "the snapshot carries no net classes; cannot confirm the project "
                       "file took effect", critical=True)]
-    problems = []
+    problems, missing = [], []
     for name, spec in want.items():
         if name not in have:
             problems.append("class %s is not on the board" % name)
             continue
         for key, board_key in (("track_width", "track"), ("clearance", "clearance"),
                                ("via_diameter", "via"), ("via_drill", "via_hole")):
-            if key in spec and board_key in have[name]:
+            if key in spec and board_key not in have[name]:
+                missing.append("class %s has no extracted %s" % (name, board_key))
+            elif key in spec:
                 if abs(float(spec[key]) - float(have[name][board_key])) > 1e-6:
                     problems.append("%s.%s is %s on the board, declared %s"
                                     % (name, key, have[name][board_key], spec[key]))
     for net, cls in want_of.items():
         got = have_of.get(net, have_of.get("/" + net))
-        if got is not None and got != cls:
+        if got is None:
+            missing.append("net %s has no extracted class assignment" % net)
+        elif got != cls:
             problems.append("net %s is in class %s, declared %s" % (net, got, cls))
     return [Check("t1.netclasses", 1, "Net classes in force",
-                  FAIL if problems else PASS,
+                  FAIL if problems else UNKNOWN if missing else PASS,
                   "%d net class deviations" % len(problems) if problems
+                  else "%d net class facts missing" % len(missing) if missing
                   else "%d classes applied, %d nets assigned" % (len(want), len(want_of)),
-                  problems, critical=True)]
+                  problems + missing, critical=True)]
 
 
 def _keepout_checks(facts, physical):

@@ -81,7 +81,8 @@ def bind_file(path):
     p = pathlib.Path(path)
     st = p.stat()
     return {"path": p.name, "sha256": sha256_of(p), "bytes": st.st_size,
-            "mtime": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")}
+            "mtime_ns": st.st_mtime_ns,
+            "mtime": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="microseconds")}
 
 
 class Report:

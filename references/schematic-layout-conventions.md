@@ -196,6 +196,10 @@ Do not invent connections to silence warnings or delete physical component pins.
 > **must preserve every connection**. Any change is a bug. It caught all of the
 > documented incidents.
 
+These three gates are the schematic stage of the tiered report
+(`kicad-author check --stage sch`). The copper stages, the four-state model and the PCB
+incident log are in [pcb-physical-conventions.md](pcb-physical-conventions.md).
+
 ## 9. Incident log (observed failures to avoid repeating)
 
 | Symptom | Root cause | Lesson |

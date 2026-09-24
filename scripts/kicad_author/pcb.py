@@ -6,6 +6,7 @@ Reusable steps derived from the current board:
   · Set the auxiliary origin at the bottom left for positive placement coordinates with Y upward
 """
 import os
+import pathlib
 import re
 import sys
 
@@ -47,15 +48,26 @@ def fix_mounting_pegs(fp):
     return n
 
 
+def copper_layer_ids(board):
+    """Copper layers this board actually has. The keepout default used to be a hardcoded
+    four-layer guess, which silently names layers a two-layer board does not enable."""
+    return [i for i in range(pcbnew.PCB_LAYER_ID_COUNT)
+            if board.IsLayerEnabled(i) and pcbnew.IsCopperLayer(i)]
+
+
 def add_keepout(board, name, points, layers=None):
-    """Copper keepout across layers, for isolation barriers and antenna clearances."""
+    """Copper keepout, for isolation barriers and antenna clearances.
+
+    `layers` defaults to **every enabled copper layer**: an antenna clearance that exists
+    only on F.Cu is a blank rectangle, not a clearance.
+    """
     z = pcbnew.ZONE(board)
     z.SetIsRuleArea(True)
     z.SetDoNotAllowZoneFills(True)
     z.SetDoNotAllowTracks(True)
     z.SetDoNotAllowVias(True)
     ls = pcbnew.LSET()
-    for ly in (layers or (pcbnew.F_Cu, pcbnew.In1_Cu, pcbnew.In2_Cu, pcbnew.B_Cu)):
+    for ly in (layers if layers is not None else copper_layer_ids(board)):
         ls.addLayer(ly)
     z.SetLayerSet(ls)
     op = z.Outline()
@@ -139,3 +151,64 @@ def set_aux_origin_bottom_left(board, height):
 
 def refill(board):
     pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+
+
+def load_uuids(path):
+    """Schematic symbol UUIDs, so footprints keep their link across regenerations."""
+    import json
+    p = pathlib.Path(path) if not hasattr(path, "read_text") else path
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def apply_stackup(board, physical):
+    """Enable the copper layers declared in src/physical.py. Returns the layer names."""
+    names = list(getattr(physical, "COPPER_LAYERS", None) or ["F.Cu", "B.Cu"])
+    board.SetCopperLayerCount(len(names))
+    for want in names:
+        lid = board.GetLayerID(want)
+        if lid < 0:
+            sys.exit("Layer %r is not a valid KiCad copper layer name" % want)
+    return names
+
+
+def apply_planes(board, physical, layout, margin=0.3):
+    """Pour each declared plane layer with the net it carries.
+
+    A layer is a reference plane because physical.py says so, not because a pour happened
+    to be drawn there; this is the step that makes the declaration true on the board.
+    """
+    planes = getattr(physical, "PLANES", None) or {}
+    rects = getattr(physical, "PLANE_RECT", None) or {}
+    made = []
+    for layer_name, net in planes.items():
+        rect = rects.get(layer_name) or (margin, margin,
+                                         layout.BOARD_W - margin, layout.BOARD_H - margin)
+        x0, y0, x1, y1 = rect
+        add_pour(board, "plane-%s" % layer_name, net, board.GetLayerID(layer_name),
+                 [(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+        made.append("%s:%s" % (layer_name, net))
+    return made
+
+
+def apply_keepouts(board, physical):
+    """Rule areas from KEEPOUTS and BARRIERS, on the layers each one declares."""
+    made = []
+    for name, ko in (getattr(physical, "KEEPOUTS", None) or {}).items():
+        want = ko.get("layers", "all")
+        ids = (copper_layer_ids(board) if want == "all"
+               else [board.GetLayerID(n) for n in want])
+        pts = ko.get("outline") or _rect_pts(ko["rect"])
+        add_keepout(board, name, pts, ids)
+        made.append(name)
+    for name, bar in (getattr(physical, "BARRIERS", None) or {}).items():
+        add_keepout(board, name, _rect_pts(bar["rect"]), copper_layer_ids(board))
+        made.append(name)
+    return made
+
+
+def _rect_pts(rect):
+    x0, y0, x1, y1 = rect
+    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]

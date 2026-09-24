@@ -28,10 +28,23 @@ ZONES = {
 }
 
 POWER_NETS = ["+3V3", "GND"]            # Always use power symbols
+
+# —— Electrical relations: which pin a part serves, and where its return current goes.
+# Position and rotation follow these pad relationships; a tidy row that breaks a loop is
+# not an improvement. What is not declared here is reported as unknown, never as a pass.
+# Kinds: decouple / protect / crystal / regulator — see references/pcb-physical-conventions.md §3
+GROUPS = {
+    "u1-vdd": ("decouple", {"cap": "C1", "ic": "U1", "pin": "1", "net": "+3V3",
+                            "ret": "GND", "max_mm": 2.0, "ret_max_mm": 3.0}),
+    # "can-tvs": ("protect", {"device": "D2", "net": "CANH",
+    #                         "exposed": ("J2", "1"), "protected": ("U2", "7")}),
+}
+
 PWR_FLAG_NETS = [("GND", 20, 206)]      # Required for ground-only nets to avoid ERC pin_not_driven
 
 # —— Optional settings below ——
 # MPNS = {"U1": "MYMCU-N4R8"}
 # POWER_SYM = {"VISO": "power:+5V"}     # Net name comes from Value; existing graphics can be reused
 # LOCAL_SYM_LIBS = {"lib": "lib/myboard.kicad_sym"}
-# ISOLATED_NETS = []                    # Isolated boards: domain net names for the isolation barrier check
+# Isolated boards: declare DOMAINS and BARRIERS in src/physical.py, not here —
+# the barrier is a physical region, and the check needs the layers it spans.

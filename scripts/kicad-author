@@ -3,6 +3,9 @@
 
   kicad-author sch      --project <dir>   Generate .kicad_sch
   kicad-author gate     --project <dir>   Compare against the golden netlist
+  kicad-author rules    --project <dir>   Net classes and custom rules from physical.py
+  kicad-author facts    --project <dir>   Snapshot the saved board (needs pcbnew)
+  kicad-author check    --project <dir>   Run the tiered checks over that snapshot
   kicad-author env                        Print detected tool paths
 
 The project must provide design.py (source of truth: PARTS/NETS/NO_CONNECT/ZONES/POWER_NETS…)
@@ -19,7 +22,10 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from kicad_author import gates                      # noqa: E402
-from kicad_author.schematic import SchematicWriter  # noqa: E402
+from kicad_author import checks as chk               # noqa: E402
+from kicad_author import facts as F                  # noqa: E402
+from kicad_author import status as st                # noqa: E402
+from kicad_author.schematic import SchematicWriter   # noqa: E402
 
 
 def find_kicad():
@@ -109,6 +115,123 @@ def cmd_gate(a):
     sys.exit(0 if ok else 1)
 
 
+def _project(a):
+    """Load design.py, layout.py and the optional physical.py, plus the board path."""
+    proj = pathlib.Path(a.project).resolve()
+    design = load_module(proj / "src" / "design.py", "design")
+    lay = proj / "src" / "layout.py"
+    layout = load_module(lay, "layout") if lay.exists() else design
+    phy_path = proj / "src" / "physical.py"
+    physical = load_module(phy_path, "physical") if phy_path.exists() else None
+    name = getattr(design, "BOARD_NAME", proj.name)
+    return proj, design, layout, physical, proj / f"{name}.kicad_pcb"
+
+
+def cmd_facts(a):
+    """Reload the saved board in KiCad's interpreter and snapshot it to JSON.
+
+    --finalize refills every pour and saves first: the hash must cover filled copper,
+    not the pre-route fills that an ImportSpecctraSES + SaveBoard leaves behind.
+    """
+    proj, _design, _layout, _phy, board = _project(a)
+    board = pathlib.Path(a.board) if a.board else board
+    if not board.exists():
+        sys.exit(f"Board not found: {board}")
+    out = pathlib.Path(a.out) if a.out else proj / "build" / "facts.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _cli, py, _s, _f = find_kicad()
+    if not py:
+        sys.exit("No Python interpreter with pcbnew — see kicad-author env")
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(HERE)!r})\n"
+        "from kicad_author import extract\n"
+        "from kicad_author import facts as F\n"
+        + (f"n = extract.finalize({str(board)!r})\nprint('   refilled %d pours' % n)\n"
+           if a.finalize else "")
+        + f"f = extract.extract({str(board)!r})\n"
+        f"F.save(f, {str(out)!r})\n"
+        "print('   facts: %d parts / %d pads / %d tracks / %d vias / %d pours / %d rule areas'\n"
+        "      % (len(f['footprints']), len(f['pads']), len(f['tracks']),\n"
+        "         len(f['vias']), len(f['zones']), len(f['rule_areas'])))\n"
+        "print('   board sha256 %s' % f['board']['sha256'][:16])\n")
+    r = subprocess.run([str(py), "-c", code], cwd=str(proj))
+    sys.exit(r.returncode)
+
+
+def cmd_check(a):
+    """Run the tiered checks against a facts snapshot and report by tier.
+
+    Refuses to report at all when the snapshot no longer matches the board on disk:
+    a report that is not bound to one board version is worse than no report.
+    """
+    proj, design, _layout, physical, board = _project(a)
+    name = getattr(design, "BOARD_NAME", proj.name)
+    waivers = getattr(physical, "WAIVERS", None) or getattr(design, "WAIVERS", {})
+    version = __import__("kicad_author").__version__
+
+    sch = proj / f"{name}.kicad_sch"
+    # ERC describes the schematic; DRC describes the board. Each report is compared
+    # against its own artifact, or every ERC run looks stale once the PCB is generated.
+    sch_bound = {"board": st.bind_file(sch)} if sch.exists() else {}
+
+    if a.stage == "sch":                      # Schematic stage: no board exists yet
+        if not sch.exists():
+            sys.exit(f"No schematic: {sch}")
+        rep = st.Report(artifact=sch_bound["board"], stage=a.stage, waivers=waivers,
+                        version=version)
+        rep.add_many(chk.erc_checks(sch_bound, proj / "build" / "erc.json"))
+        rep.add(chk.golden_netlist(proj / "build" / f"{name}.net", design))
+    else:
+        facts_path = pathlib.Path(a.facts) if a.facts else proj / "build" / "facts.json"
+        if not facts_path.exists():
+            sys.exit(f"No facts snapshot: {facts_path} — run kicad-author facts first")
+        facts = F.load(facts_path)
+        ok, msg = F.verify_binding(facts, board)
+        if not ok:
+            sys.exit(f"Stale snapshot — {msg}")
+        print(f"   {msg}")
+        rep = st.Report(artifact=facts["board"], stage=a.stage, waivers=waivers,
+                        version=version)
+        rep.add_many(chk.artifact(facts, design))
+        rep.add_many(chk.relations(facts, design))
+        rep.add_many(chk.layers_and_planes(facts, physical, design))
+        rep.add_many(chk.appearance(facts, physical))
+        rep.add_many(chk.erc_checks(sch_bound or facts, proj / "build" / "erc.json"))
+        if a.stage == "final":
+            rep.add_many(chk.drc_checks(facts, proj / "build" / "drc.json"))
+    print(rep.text())
+    out = pathlib.Path(a.json) if a.json else proj / "build" / f"report-{a.stage}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rep.write_json(out)
+    print("   report → %s" % os.path.relpath(str(out), str(proj)))
+    sys.exit(rep.exit_code())
+
+
+def cmd_rules(a):
+    """Emit net classes into <board>.kicad_pro and custom rules into <board>.kicad_dru.
+
+    Run before generating the PCB: the autorouter reads net class widths through the DSN
+    export, so declaring them afterwards changes nothing about how the board was routed.
+    """
+    proj, design, _layout, physical, board = _project(a)
+    if physical is None:
+        sys.exit("No src/physical.py — nothing declares layers, net classes or planes. "
+                 "Copy templates/physical.py into the project.")
+    from kicad_author import stack as S
+    errs = S.validate(physical, design)
+    if errs:
+        print("   ✗ declaration errors:")
+        for e in errs:
+            print("      · " + e)
+        sys.exit(1)
+    pro = board.with_suffix(".kicad_pro")
+    n_cls, n_pat = S.write_project(pro, physical)
+    n_rules = S.write_dru(board.with_suffix(".kicad_dru"), physical)
+    print(f"✓ {pro.name}: {n_cls} net classes / {n_pat} net assignments")
+    print(f"✓ {board.with_suffix('.kicad_dru').name}: {n_rules} custom rules")
+
+
 def cmd_env(a):
     cli, py, syms, fps = find_kicad()
     if a.export:                      # For shell `eval "$(kicad-author env --export)"`
@@ -130,6 +253,23 @@ def main():
         s = sub.add_parser(name)
         s.add_argument("--project", default=".")
         s.set_defaults(fn=fn)
+    ru = sub.add_parser("rules", help="Write net classes and custom rules")
+    ru.add_argument("--project", default=".")
+    ru.set_defaults(fn=cmd_rules)
+    fa = sub.add_parser("facts", help="Snapshot the saved board (needs pcbnew)")
+    fa.add_argument("--project", default=".")
+    fa.add_argument("--board", help="Board file (default: <BOARD_NAME>.kicad_pcb)")
+    fa.add_argument("--out", help="Output JSON (default: build/facts.json)")
+    fa.add_argument("--finalize", action="store_true",
+                    help="Refill every pour and save before snapshotting")
+    fa.set_defaults(fn=cmd_facts)
+    ck = sub.add_parser("check", help="Run the tiered checks over a facts snapshot")
+    ck.add_argument("--project", default=".")
+    ck.add_argument("--facts", help="Facts JSON (default: build/facts.json)")
+    ck.add_argument("--stage", default="final",
+                    choices=("sch", "preroute", "final"))
+    ck.add_argument("--json", help="Report JSON (default: build/report-<stage>.json)")
+    ck.set_defaults(fn=cmd_check)
     e = sub.add_parser("env")
     e.add_argument("--export", action="store_true",
                    help="Print shell export statements for eval")
